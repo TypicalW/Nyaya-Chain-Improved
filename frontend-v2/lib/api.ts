@@ -163,7 +163,7 @@ export function verifyEvidence(id: string) {
       };
       
       verified: boolean;
-      status: "Verified" | "Tampered";
+      status: "Verified" | "Tampered" | "Missing";
     };
   }>(`/api/evidence/${id}/verify`, {
     method: "GET",
@@ -198,4 +198,41 @@ export function updateFirStatus(id: string, status: FirStatus) {
     method: "PATCH",
     body: JSON.stringify({ status }),
   });
+}
+
+export type CustodyEvent = {
+  id: string;
+  evidenceId: string | null;
+  type: string;
+  source: string;
+  actorLabel: string;
+  summary: string;
+  metadata: Record<string, unknown>;
+  occurredAt: string;
+  recordedAt: string;
+};
+
+export type CustodyCase = {
+  id: string;
+  firNumber: string;
+  complainantName: string;
+  status: FirStatus;
+  createdAt: string;
+  evidence: { total: number; verified: number; tampered: number; missing: number };
+  eventCount: number;
+  latestEvent: { type: string; summary: string; occurredAt: string } | null;
+};
+
+export type CustodyDetails = {
+  fir: Pick<FirSummary, "id" | "firNumber" | "complainantName" | "status" | "createdAt">;
+  evidence: Array<Pick<Evidence, "id" | "fileName" | "fileType" | "fileHash" | "blockchainTxHash" | "verificationStatus" | "uploadedAt">>;
+  events: CustodyEvent[];
+};
+
+export function getCustodyCases(limit = 50) {
+  return request<{ cases: CustodyCase[] }>(`/api/custody/cases?limit=${limit}`, { method: "GET" });
+}
+
+export function getCustodyDetails(id: string) {
+  return request<CustodyDetails>(`/api/custody/firs/${id}`, { method: "GET" });
 }

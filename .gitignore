@@ -1,3 +1,4 @@
+
 # v0 sandbox internal files
 __v0_runtime_loader.js
 __v0_devtools.tsx
@@ -7,12 +8,12 @@ __v0_jsx-dev-runtime.ts
 .vercel/
 next.user-config.*
 
-# Environment variables
+# Environment variables - frontend and backend
 .env
 .env.*
 !.env.example
 
 # Common ignores
-node_modules
+node_modules/
 .next/
 .DS_Store

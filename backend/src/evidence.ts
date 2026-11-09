@@ -7,6 +7,7 @@ import {
   registerEvidenceOnBlockchain,
   verifyEvidenceOnBlockchain,
 } from "./blockchain.js";
+import { recordCustodyEvent } from "./custody.js";
 
 const router = Router();
 
@@ -172,6 +173,19 @@ router.post(
         );
       }
 
+      await recordCustodyEvent({
+        firId,
+        evidenceId: evidence.id,
+        eventType: "EVIDENCE_UPLOADED",
+        summary: `Evidence uploaded: ${evidence.file_name}`,
+        metadata: {
+          fileName: evidence.file_name,
+          fileType: evidence.file_type,
+          fileHash: evidence.file_hash,
+          storagePath: evidence.storage_path,
+        },
+      });
+
       // -----------------------------------------------------
       // 6. Register the hash on the Sepolia blockchain
       // -----------------------------------------------------
@@ -191,6 +205,21 @@ router.post(
 
         verificationStatus = "Verified";
 
+        await recordCustodyEvent({
+          firId,
+          evidenceId: evidence.id,
+          eventType: "BLOCKCHAIN_REGISTERED",
+          source: "Blockchain",
+          actorLabel: "Sepolia",
+          summary: `Evidence anchored on blockchain: ${evidence.file_name}`,
+          metadata: {
+            fileName: evidence.file_name,
+            fileHash: evidence.file_hash,
+            transactionHash: blockchainTxHash,
+            blockNumber: blockchainResult.blockNumber,
+          },
+        });
+
         console.log(
           "Evidence registered on blockchain:",
           blockchainTxHash
@@ -207,6 +236,16 @@ router.post(
           "Blockchain registration failed:",
           blockchainError
         );
+
+        await recordCustodyEvent({
+          firId,
+          evidenceId: evidence.id,
+          eventType: "BLOCKCHAIN_REGISTRATION_PENDING",
+          source: "Blockchain",
+          actorLabel: "Sepolia",
+          summary: `Blockchain registration pending: ${evidence.file_name}`,
+          metadata: { fileName: evidence.file_name, fileHash: evidence.file_hash },
+        });
       }
 
       // -----------------------------------------------------
@@ -356,8 +395,31 @@ router.get(
           .download(evidence.storage_path);
 
       if (downloadError || !file) {
-        return response.status(500).json({
-          error: "Evidence file could not be retrieved.",
+        await supabase
+          .from("evidence")
+          .update({ verification_status: "Missing" })
+          .eq("id", evidence.id);
+
+        await recordCustodyEvent({
+          firId: evidence.fir_id,
+          evidenceId: evidence.id,
+          eventType: "EVIDENCE_MISSING",
+          summary: `Evidence file unavailable during verification: ${evidence.file_name}`,
+          metadata: { fileName: evidence.file_name, storagePath: evidence.storage_path },
+        });
+
+        return response.json({
+          verification: {
+            evidenceId: evidence.id,
+            firId: evidence.fir_id,
+            firNumber: fir.fir_number,
+            originalHash: evidence.file_hash,
+            currentHash: null,
+            fileHashMatches: false,
+            blockchain: { exists: false, firNumber: null, firNumberMatches: false, timestamp: null, uploadedBy: null, transactionHash: evidence.blockchain_tx_hash },
+            verified: false,
+            status: "Missing",
+          },
         });
       }
 
@@ -433,6 +495,24 @@ router.get(
           statusError
         );
       }
+
+      await recordCustodyEvent({
+        firId: evidence.fir_id,
+        evidenceId: evidence.id,
+        eventType: verified ? "EVIDENCE_VERIFIED" : "EVIDENCE_TAMPERED",
+        source: "Integrity verifier",
+        summary: verified
+          ? `Evidence integrity verified: ${evidence.file_name}`
+          : `Evidence integrity check failed: ${evidence.file_name}`,
+        metadata: {
+          fileName: evidence.file_name,
+          originalHash: evidence.file_hash,
+          currentHash,
+          fileHashMatches,
+          blockchainExists,
+          blockchainFirMatches,
+        },
+      });
 
       // -----------------------------------------------------
       // 10. Return verification result
@@ -722,6 +802,16 @@ router.post(
           );
         }
 
+        await recordCustodyEvent({
+          firId: evidence.fir_id,
+          evidenceId: evidence.id,
+          eventType: "BLOCKCHAIN_REGISTERED",
+          source: "Blockchain",
+          actorLabel: "Sepolia",
+          summary: "Existing blockchain evidence record confirmed",
+          metadata: { fileHash: evidence.file_hash, transactionHash: updatedEvidence.blockchain_tx_hash },
+        });
+
         return response.json({
           message:
             "Evidence hash already exists on the blockchain.",
@@ -800,6 +890,16 @@ router.post(
           }`
         );
       }
+
+      await recordCustodyEvent({
+        firId: evidence.fir_id,
+        evidenceId: evidence.id,
+        eventType: "BLOCKCHAIN_REGISTERED",
+        source: "Blockchain",
+        actorLabel: "Sepolia",
+        summary: "Evidence anchored on blockchain after retry",
+        metadata: { fileHash: evidence.file_hash, transactionHash: blockchainResult.transactionHash, blockNumber: blockchainResult.blockNumber },
+      });
 
       // -----------------------------------------------------
       // 7. Return result
