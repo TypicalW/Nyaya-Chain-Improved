@@ -23,6 +23,8 @@ const eventAppearance: Record<string, { icon: typeof CircleDot; tone: string }> 
   EVIDENCE_VERIFIED: { icon: SearchCheck, tone: "bg-success/15 text-success" },
   EVIDENCE_TAMPERED: { icon: AlertTriangle, tone: "bg-destructive/15 text-destructive" },
   EVIDENCE_MISSING: { icon: FileWarning, tone: "bg-destructive/15 text-destructive" },
+  EVIDENCE_RECOVERED: { icon: CheckCircle2, tone: "bg-success/15 text-success" },
+  EVIDENCE_VERIFICATION_FAILED: { icon: Clock3, tone: "bg-warning/15 text-warning" },
 }
 
 function formatDate(value: string) { return new Intl.DateTimeFormat("en-IN", { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value)) }

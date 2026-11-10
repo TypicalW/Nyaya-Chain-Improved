@@ -44,6 +44,7 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
+  FileWarning,
 } from "lucide-react"
 
 
@@ -70,6 +71,7 @@ export default function CaseDetailPage() {
     id: string
     verified: boolean
     status: string
+    message?: string
   } | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -127,10 +129,17 @@ export default function CaseDetailPage() {
         id,
         verified: result.verification.verified,
         status: result.verification.status,
+        message: result.verification.verificationError,
       })
       await load()
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Verification failed.")
+      setVerifyResult({
+        id,
+        verified: false,
+        status: "Verification Error",
+        message: err instanceof Error ? err.message : "Verification failed.",
+      })
+      await load()
     } finally {
       setBusyEvidenceId(null)
     }
@@ -351,15 +360,16 @@ export default function CaseDetailPage() {
                       className={
                         item.verificationStatus === "Verified"
                           ? "bg-success/10 text-success border-success/20"
-                          : item.verificationStatus === "Tampered"
+                          : item.verificationStatus === "Tampered" || item.verificationStatus === "Missing"
                             ? "bg-destructive/10 text-destructive border-destructive/20"
                             : "bg-warning/10 text-warning border-warning/20"
                       }
                     >
                       {item.verificationStatus === "Verified" && <CheckCircle2 className="h-3 w-3 mr-1" />}
                       {item.verificationStatus === "Tampered" && <XCircle className="h-3 w-3 mr-1" />}
+                      {item.verificationStatus === "Missing" && <FileWarning className="h-3 w-3 mr-1" />}
                       {item.verificationStatus === "Pending" && <Clock className="h-3 w-3 mr-1" />}
-                      {item.verificationStatus}
+                      Integrity: {item.verificationStatus}
                     </Badge>
 
                     <Badge
@@ -378,15 +388,11 @@ export default function CaseDetailPage() {
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8"
-                        title="Re-verify against database and blockchain"
+                        title="Verify evidence integrity"
                         onClick={() => void handleVerify(item.id)}
                         disabled={busyEvidenceId === item.id}
                       >
-                        {busyEvidenceId === item.id ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Eye className="h-4 w-4" />
-                        )}
+                        {busyEvidenceId === item.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
                       </Button>
                       <Button
                         variant="ghost"
@@ -402,17 +408,34 @@ export default function CaseDetailPage() {
 
                     {verifyResult?.id === item.id && (
                       <p
-                        className={`w-full text-xs ${verifyResult.verified ? "text-success" : "text-destructive"}`}
+                        className={`w-full text-xs ${verifyResult.verified ? "text-success" : verifyResult.status === "Pending" || verifyResult.status === "Verification Error" ? "text-warning" : "text-destructive"}`}
                       >
                         {verifyResult.verified
                           ? "Verified: file hash and blockchain record both match."
-                          : "Tampered: file hash or blockchain record did not match."}
+                          : verifyResult.status === "Missing"
+                            ? "Missing: the original file is unavailable in Supabase Storage."
+                            : verifyResult.status === "Tampered"
+                              ? "Tampered: the current file hash does not match the original hash."
+                              : verifyResult.status === "Verification Error"
+                                ? `Verification Error: ${verifyResult.message ?? "The last known integrity status is unchanged."}`
+                                : `Verification pending: ${verifyResult.message ?? "blockchain registration is incomplete."}`}
                       </p>
                     )}
 
                     <div className="grid w-full gap-3 border-t border-border/50 pt-4 sm:grid-cols-2">
                       <BlockchainDemoButton fileHash={item.fileHash} firNumber={fir.firNumber} />
-                      <VerifyOnChainButton fileHash={item.fileHash} />
+                      <VerifyOnChainButton
+                        evidenceId={item.id}
+                        onComplete={(result: { verified: boolean; status: string; verificationError?: string } | undefined) => {
+                          if (result) setVerifyResult({
+                            id: item.id,
+                            verified: result.verified,
+                            status: result.status,
+                            message: result.verificationError,
+                          })
+                          return load()
+                        }}
+                      />
                     </div>
                   </div>
                 ))}

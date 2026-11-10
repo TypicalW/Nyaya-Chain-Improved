@@ -150,8 +150,8 @@ export function verifyEvidence(id: string) {
       firId: string;
       firNumber: string;
       originalHash: string;
-      currentHash: string;
-      fileHashMatches: boolean;
+      currentHash: string | null;
+      fileHashMatches: boolean | null;
 
       blockchain: {
         exists: boolean;
@@ -163,7 +163,8 @@ export function verifyEvidence(id: string) {
       };
       
       verified: boolean;
-      status: "Verified" | "Tampered" | "Missing";
+      status: "Verified" | "Tampered" | "Missing" | "Pending" | "Verification Error";
+      verificationError?: string;
     };
   }>(`/api/evidence/${id}/verify`, {
     method: "GET",

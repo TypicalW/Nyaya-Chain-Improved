@@ -1,8 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { ethers } from "ethers"
-import { CONTRACT_ABI, CONTRACT_ADDRESS } from "@/lib/contract"
+import { verifyEvidence } from "@/lib/api"
 
 const cardStyle = {
   border: "1px solid #4f46e5",
@@ -11,43 +10,36 @@ const cardStyle = {
   background: "rgba(79, 70, 229, 0.08)",
 }
 
-export function VerifyOnChainButton({ fileHash }) {
+const statusMessage = {
+  Verified: "Verified: file hash and blockchain record both match.",
+  Tampered: "Tampered: the current file hash does not match the original hash.",
+  Missing: "Missing: the original file is unavailable in Supabase Storage.",
+  Pending: "Verification is pending because storage or blockchain verification could not be completed.",
+  "Verification Error": "Verification could not be completed. The last known integrity status is unchanged.",
+}
+
+export function VerifyOnChainButton({ evidenceId, onComplete }) {
   const [status, setStatus] = useState("idle")
-  const [record, setRecord] = useState(null)
-  const [error, setError] = useState("")
+  const [message, setMessage] = useState("")
 
   async function verifyOnChain() {
     setStatus("loading")
-    setError("")
-    setRecord(null)
+    setMessage("")
 
     try {
-      const rpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL
-      if (!rpcUrl) {
-        throw new Error("NEXT_PUBLIC_SEPOLIA_RPC_URL is not configured for this frontend.")
-      }
-
-      const provider = new ethers.JsonRpcProvider(rpcUrl)
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider)
-      const exists = await contract.verifyEvidence(fileHash)
-
-      if (!exists) {
-        setStatus("missing")
-        return
-      }
-
-      const [firNumber, timestamp, uploadedBy] = await contract.getEvidence(fileHash)
-      setRecord({
-        firNumber,
-        timestamp: new Date(Number(timestamp) * 1000).toLocaleString(),
-        uploadedBy,
-      })
-      setStatus("verified")
+      const result = await verifyEvidence(evidenceId)
+      const outcome = result.verification.status
+      setStatus(outcome)
+      setMessage(result.verification.verificationError || statusMessage[outcome])
+      await onComplete?.(result.verification)
     } catch (err) {
-      setError(err?.reason || err?.message || "Unable to verify this hash on Sepolia.")
-      setStatus("error")
+      setMessage(`Verification Error: ${err instanceof Error ? err.message : "Unable to verify this evidence."}`)
+      setStatus("Verification Error")
+      await onComplete?.()
     }
   }
+
+  const tone = status === "Verified" ? "#86efac" : status === "Pending" ? "#fcd34d" : "#fca5a5"
 
   return (
     <div style={cardStyle}>
@@ -65,29 +57,9 @@ export function VerifyOnChainButton({ fileHash }) {
           fontWeight: 600,
         }}
       >
-        {status === "loading" ? "Checking Sepolia..." : "Verify on Blockchain"}
+        {status === "loading" ? "Verifying evidence..." : "Verify on Blockchain"}
       </button>
-
-      {status === "missing" && (
-        <p style={{ margin: "10px 0 0", fontSize: "14px", color: "#fcd34d" }}>
-          This hash is not registered on Sepolia.
-        </p>
-      )}
-
-      {status === "verified" && record && (
-        <div style={{ marginTop: "10px", fontSize: "14px", lineHeight: 1.6, color: "#c7d2fe" }}>
-          <div>Hash exists on Sepolia.</div>
-          <div>FIR: {record.firNumber}</div>
-          <div>Registered: {record.timestamp}</div>
-          <div style={{ overflowWrap: "anywhere" }}>Uploaded by: {record.uploadedBy}</div>
-        </div>
-      )}
-
-      {status === "error" && (
-        <p role="alert" style={{ margin: "10px 0 0", fontSize: "14px", color: "#fca5a5" }}>
-          {error}
-        </p>
-      )}
+      {status !== "idle" && status !== "loading" && <p role="status" style={{ margin: "10px 0 0", fontSize: "14px", color: tone }}>{message}</p>}
     </div>
   )
 }

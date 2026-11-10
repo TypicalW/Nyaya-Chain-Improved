@@ -67,19 +67,8 @@ function derivedEvents(fir: { id: string; fir_number: string; created_at: string
       occurred_at: item.uploaded_at,
       recorded_at: item.uploaded_at,
     })
-    if (item.verification_status === "Tampered" || item.verification_status === "Missing") events.push({
-      id: `derived-integrity-${item.id}`,
-      evidence_id: item.id,
-      event_type: item.verification_status === "Missing" ? "EVIDENCE_MISSING" : "EVIDENCE_TAMPERED",
-      source: "Historical record",
-      actor_label: "Integrity verifier",
-      summary: `${item.verification_status} evidence detected: ${item.file_name}`,
-      metadata: { fileName: item.file_name, historical: true },
-      occurred_at: item.uploaded_at,
-      recorded_at: item.uploaded_at,
-    })
   })
-  return events.sort((a, b) => a.occurred_at.localeCompare(b.occurred_at))
+  return events.sort((a, b) => a.occurred_at.localeCompare(b.occurred_at) || a.recorded_at.localeCompare(b.recorded_at) || a.id.localeCompare(b.id))
 }
 
 export type CustodyEventInput = {
@@ -105,7 +94,25 @@ export async function recordCustodyEvent(event: CustodyEventInput) {
     occurred_at: event.occurredAt ?? new Date().toISOString(),
   })
 
-  if (error) console.error("Custody event could not be recorded:", error.message)
+  if (error) throw new Error(`Custody event could not be recorded: ${error.message}`)
+}
+
+const integrityEventTypes = ["EVIDENCE_VERIFIED", "EVIDENCE_TAMPERED", "EVIDENCE_MISSING", "EVIDENCE_RECOVERED"]
+
+export async function recordIntegrityTransition(event: CustodyEventInput) {
+  if (!event.evidenceId) throw new Error("Integrity transition requires an evidence ID.")
+  const { data: latest, error } = await supabase.from("custody_events")
+    .select("event_type")
+    .eq("evidence_id", event.evidenceId)
+    .in("event_type", integrityEventTypes)
+    .order("occurred_at", { ascending: false })
+    .order("recorded_at", { ascending: false })
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (error) throw new Error(`Previous integrity events could not be checked: ${error.message}`)
+  if (latest?.event_type === event.eventType) return
+  await recordCustodyEvent(event)
 }
 
 const custodyRouter = Router()
@@ -118,7 +125,7 @@ custodyRouter.get("/cases", async (request, response) => {
       supabase.from("evidence").select("id, fir_id, file_name, file_hash, blockchain_tx_hash, verification_status, uploaded_at"),
     ])
     if (firError || evidenceError) throw new Error(firError?.message ?? evidenceError?.message)
-    const { data: events, error: eventError } = await supabase.from("custody_events").select("fir_id, event_type, summary, occurred_at").order("occurred_at", { ascending: false })
+    const { data: events, error: eventError } = await supabase.from("custody_events").select("fir_id, event_type, summary, occurred_at, recorded_at, id").order("occurred_at", { ascending: false }).order("recorded_at", { ascending: false }).order("id", { ascending: false })
 
     const evidenceByFir = new Map<string, { total: number; verified: number; tampered: number; missing: number }>()
     for (const item of evidence ?? []) {
@@ -167,14 +174,14 @@ custodyRouter.get("/firs/:id", async (request, response) => {
     ])
     if (firError || !fir) return response.status(404).json({ error: "FIR not found." })
     if (evidenceError) throw new Error(evidenceError.message)
-    const { data: events, error: eventError } = await supabase.from("custody_events").select("id, evidence_id, event_type, source, actor_label, summary, metadata, occurred_at, recorded_at").eq("fir_id", id).order("occurred_at", { ascending: true })
+    const { data: events, error: eventError } = await supabase.from("custody_events").select("id, evidence_id, event_type, source, actor_label, summary, metadata, occurred_at, recorded_at").eq("fir_id", id).order("occurred_at", { ascending: true }).order("recorded_at", { ascending: true }).order("id", { ascending: true })
     const evidenceItems = evidence ?? []
     const actualEvents = events ?? []
     const inferredEvents = derivedEvents(fir, evidenceItems)
     const custodyEvents = eventError
       ? inferredEvents
       : [...actualEvents, ...inferredEvents.filter((item) => !actualEvents.some((event) => event.event_type === item.event_type && event.evidence_id === item.evidence_id))]
-          .sort((left, right) => left.occurred_at.localeCompare(right.occurred_at))
+          .sort((left, right) => left.occurred_at.localeCompare(right.occurred_at) || left.recorded_at.localeCompare(right.recorded_at) || left.id.localeCompare(right.id))
     response.json({
       fir: { id: fir.id, firNumber: fir.fir_number, complainantName: fir.complainant_name, status: fir.status, createdAt: fir.created_at },
       evidence: evidenceItems.map((item) => ({ id: item.id, fileName: item.file_name, fileType: item.file_type, fileHash: item.file_hash, blockchainTxHash: item.blockchain_tx_hash, verificationStatus: item.verification_status, uploadedAt: item.uploaded_at })),
