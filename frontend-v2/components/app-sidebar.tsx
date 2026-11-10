@@ -4,7 +4,7 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { Logo } from "@/components/logo"
-import { Home, FilePlus2, FolderOpen, BarChart3, ChevronLeft, ChevronRight } from "lucide-react"
+import { Home, FilePlus2, FolderOpen, BarChart3, GitBranch, ChevronLeft, ChevronRight } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useState } from "react"
 
@@ -12,6 +12,7 @@ const navigation = [
   { name: "Home", href: "/", icon: Home },
   { name: "File a Report", href: "/report", icon: FilePlus2 },
   { name: "Cases", href: "/cases", icon: FolderOpen },
+  { name: "Chain of Custody", href: "/custody", icon: GitBranch },
   { name: "Analytics", href: "/analytics", icon: BarChart3 },
 ]
 

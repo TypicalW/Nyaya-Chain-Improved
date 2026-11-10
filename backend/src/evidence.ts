@@ -7,6 +7,7 @@ import {
   registerEvidenceOnBlockchain,
   verifyEvidenceOnBlockchain,
 } from "./blockchain.js";
+import { recordCustodyEvent, recordIntegrityTransition } from "./custody.js";
 
 const router = Router();
 
@@ -30,6 +31,40 @@ const supabase = createClient(
 const evidenceSchema = z.object({
   firId: z.string().uuid(),
 });
+
+function isConfirmedMissingStorageObject(error: unknown) {
+  const candidate = error as { statusCode?: number | string; message?: string } | null;
+  const status = Number(candidate?.statusCode);
+  const message = candidate?.message?.toLowerCase() ?? "";
+  return status === 404 || message.includes("object not found");
+}
+
+async function setVerificationStatus(evidenceId: string, status: "Verified" | "Tampered" | "Missing" | "Pending") {
+  const { error } = await supabase
+    .from("evidence")
+    .update({ verification_status: status })
+    .eq("id", evidenceId);
+  if (error) throw new Error(`Evidence status could not be updated: ${error.message}`);
+}
+
+async function recordVerificationFailure(input: {
+  firId: string; evidenceId: string; fileName: string; source: string;
+  category: string; checkedAt: string; failureReason: string;
+  originalHash?: string; currentHash?: string;
+}) {
+  const dedupeKey = `verification-error:${input.category}`;
+  const { data, error } = await supabase.from("custody_events")
+    .select("id").eq("evidence_id", input.evidenceId)
+    .eq("event_type", "EVIDENCE_VERIFICATION_FAILED")
+    .contains("metadata", { dedupeKey }).limit(1);
+  if (!error && data?.length) return;
+  await recordCustodyEvent({
+    firId: input.firId, evidenceId: input.evidenceId,
+    eventType: "EVIDENCE_VERIFICATION_FAILED", source: input.source,
+    summary: `Evidence verification could not be completed: ${input.fileName}`,
+    metadata: { fileName: input.fileName, dedupeKey, verificationMethod: "Manual", checkedAt: input.checkedAt, failureReason: input.failureReason, ...(input.originalHash ? { originalHash: input.originalHash } : {}), ...(input.currentHash ? { currentHash: input.currentHash } : {}) },
+  });
+}
 
 
 /*
@@ -172,6 +207,19 @@ router.post(
         );
       }
 
+      await recordCustodyEvent({
+        firId,
+        evidenceId: evidence.id,
+        eventType: "EVIDENCE_UPLOADED",
+        summary: `Evidence uploaded: ${evidence.file_name}`,
+        metadata: {
+          fileName: evidence.file_name,
+          fileType: evidence.file_type,
+          fileHash: evidence.file_hash,
+          storagePath: evidence.storage_path,
+        },
+      });
+
       // -----------------------------------------------------
       // 6. Register the hash on the Sepolia blockchain
       // -----------------------------------------------------
@@ -191,6 +239,21 @@ router.post(
 
         verificationStatus = "Verified";
 
+        await recordCustodyEvent({
+          firId,
+          evidenceId: evidence.id,
+          eventType: "BLOCKCHAIN_REGISTERED",
+          source: "Blockchain",
+          actorLabel: "Sepolia",
+          summary: `Evidence anchored on blockchain: ${evidence.file_name}`,
+          metadata: {
+            fileName: evidence.file_name,
+            fileHash: evidence.file_hash,
+            transactionHash: blockchainTxHash,
+            blockNumber: blockchainResult.blockNumber,
+          },
+        });
+
         console.log(
           "Evidence registered on blockchain:",
           blockchainTxHash
@@ -207,6 +270,16 @@ router.post(
           "Blockchain registration failed:",
           blockchainError
         );
+
+        await recordCustodyEvent({
+          firId,
+          evidenceId: evidence.id,
+          eventType: "BLOCKCHAIN_REGISTRATION_PENDING",
+          source: "Blockchain",
+          actorLabel: "Sepolia",
+          summary: `Blockchain registration pending: ${evidence.file_name}`,
+          metadata: { fileName: evidence.file_name, fileHash: evidence.file_hash },
+        });
       }
 
       // -----------------------------------------------------
@@ -223,10 +296,7 @@ router.post(
           .eq("id", evidence.id);
 
       if (blockchainUpdateError) {
-        console.error(
-          "Failed to update blockchain information:",
-          blockchainUpdateError
-        );
+        throw new Error(`Blockchain registration completed, but evidence metadata could not be updated: ${blockchainUpdateError.message}`);
       }
 
       // -----------------------------------------------------
@@ -292,197 +362,97 @@ router.post(
  * Verified / Tampered
  */
 
-router.get(
-  "/:id/verify",
-  async (request, response) => {
-    try {
-      const { id } = z.object({
-        id: z.string().uuid(),
-      }).parse(request.params);
+router.get("/:id/verify", async (request, response) => {
+  try {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const checkedAt = new Date().toISOString();
+    const { data: evidence, error: evidenceError } = await supabase
+      .from("evidence")
+      .select("id, fir_id, file_name, storage_path, file_hash, blockchain_tx_hash, verification_status")
+      .eq("id", id)
+      .single();
+    if (evidenceError || !evidence) return response.status(404).json({ error: "Evidence not found." });
 
-      // -----------------------------------------------------
-      // 1. Retrieve the evidence record
-      // -----------------------------------------------------
+    const { data: fir, error: firError } = await supabase
+      .from("firs")
+      .select("id, fir_number")
+      .eq("id", evidence.fir_id)
+      .single();
+    if (firError || !fir) return response.status(404).json({ error: "Associated FIR not found." });
 
-      const { data: evidence, error: evidenceError } =
-        await supabase
-          .from("evidence")
-          .select(
-            `
-            id,
-            fir_id,
-            file_name,
-            file_type,
-            storage_path,
-            file_hash,
-            blockchain_tx_hash,
-            verification_status,
-            uploaded_at
-            `
-          )
-          .eq("id", id)
-          .single();
+    const base = {
+      evidenceId: evidence.id,
+      firId: evidence.fir_id,
+      firNumber: fir.fir_number,
+      originalHash: evidence.file_hash,
+      blockchain: { exists: false, firNumber: null, firNumberMatches: false, timestamp: null, uploadedBy: null, transactionHash: evidence.blockchain_tx_hash },
+      checkedAt,
+      verificationMethod: "Manual" as const,
+    };
+    const { data: file, error: downloadError } = await supabase.storage.from("evidence").download(evidence.storage_path);
 
-      if (evidenceError || !evidence) {
-        return response.status(404).json({
-          error: "Evidence not found.",
+    if (downloadError || !file) {
+      if (downloadError && isConfirmedMissingStorageObject(downloadError)) {
+        await setVerificationStatus(evidence.id, "Missing");
+        await recordIntegrityTransition({
+          firId: evidence.fir_id, evidenceId: evidence.id, eventType: "EVIDENCE_MISSING", source: "Integrity verifier",
+          summary: `Evidence file unavailable during manual verification: ${evidence.file_name}`,
+          metadata: { fileName: evidence.file_name, storagePath: evidence.storage_path, originalHash: evidence.file_hash, previousStatus: evidence.verification_status, nextStatus: "Missing", verificationMethod: "Manual", checkedAt },
         });
+        return response.json({ verification: { ...base, currentHash: null, fileHashMatches: null, verified: false, status: "Missing" } });
       }
 
-      // -----------------------------------------------------
-      // 2. Retrieve the FIR number
-      // -----------------------------------------------------
-
-      const { data: fir, error: firError } =
-        await supabase
-          .from("firs")
-          .select("id, fir_number")
-          .eq("id", evidence.fir_id)
-          .single();
-
-      if (firError || !fir) {
-        return response.status(404).json({
-          error: "Associated FIR not found.",
-        });
-      }
-
-      // -----------------------------------------------------
-      // 3. Download the actual evidence file
-      // -----------------------------------------------------
-
-      const { data: file, error: downloadError } =
-        await supabase.storage
-          .from("evidence")
-          .download(evidence.storage_path);
-
-      if (downloadError || !file) {
-        return response.status(500).json({
-          error: "Evidence file could not be retrieved.",
-        });
-      }
-
-      // -----------------------------------------------------
-      // 4. Calculate the current SHA-256
-      // -----------------------------------------------------
-
-      const fileBuffer = Buffer.from(
-        await file.arrayBuffer()
-      );
-
-      const currentHash = createHash("sha256")
-        .update(fileBuffer)
-        .digest("hex");
-
-      // -----------------------------------------------------
-      // 5. Compare current file against original hash
-      // -----------------------------------------------------
-
-      const fileHashMatches =
-        currentHash === evidence.file_hash;
-
-      // -----------------------------------------------------
-      // 6. Query the blockchain
-      // -----------------------------------------------------
-
-      const blockchainRecord =
-        await verifyEvidenceOnBlockchain(
-          evidence.file_hash
-        );
-
-      // -----------------------------------------------------
-      // 7. Compare blockchain information
-      // -----------------------------------------------------
-
-      const blockchainExists =
-        blockchainRecord.exists;
-
-      const blockchainFirMatches =
-        blockchainExists &&
-        blockchainRecord.firNumber === fir.fir_number;
-
-      // -----------------------------------------------------
-      // 8. Determine final verification result
-      // -----------------------------------------------------
-
-      const verified =
-        fileHashMatches &&
-        blockchainExists &&
-        blockchainFirMatches;
-
-      const verificationStatus =
-        verified
-          ? "Verified"
-          : "Tampered";
-
-      // -----------------------------------------------------
-      // 9. Update verification status
-      // -----------------------------------------------------
-
-      const { error: statusError } =
-        await supabase
-          .from("evidence")
-          .update({
-            verification_status:
-              verificationStatus,
-          })
-          .eq("id", evidence.id);
-
-      if (statusError) {
-        console.error(
-          "Failed to update verification status:",
-          statusError
-        );
-      }
-
-      // -----------------------------------------------------
-      // 10. Return verification result
-      // -----------------------------------------------------
-
-      return response.json({
-        verification: {
-          evidenceId: evidence.id,
-          firId: evidence.fir_id,
-          firNumber: fir.fir_number,
-
-          originalHash: evidence.file_hash,
-          currentHash,
-
-          fileHashMatches,
-
-          blockchain: {
-            exists: blockchainExists,
-            firNumber:
-              blockchainRecord.firNumber,
-            firNumberMatches:
-              blockchainFirMatches,
-            timestamp:
-              blockchainRecord.timestamp,
-            uploadedBy:
-              blockchainRecord.uploadedBy,
-            transactionHash:
-              evidence.blockchain_tx_hash,
-          },
-
-          verified,
-          status: verificationStatus,
-        },
-      });
-
-    } catch (error) {
-      console.error(
-        "Evidence verification failed:",
-        error
-      );
-
-      return response.status(400).json({
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unable to verify evidence.",
-      });
+      const failureReason = downloadError?.message ?? "Storage returned no file data.";
+      await recordVerificationFailure({ firId: evidence.fir_id, evidenceId: evidence.id, fileName: evidence.file_name, source: "Integrity verifier", category: "storage-unavailable", checkedAt, failureReason });
+      return response.json({ verification: { ...base, currentHash: null, fileHashMatches: null, verified: false, status: "Verification Error", verificationError: failureReason } });
     }
+
+    const currentHash = createHash("sha256").update(Buffer.from(await file.arrayBuffer())).digest("hex");
+    const fileHashMatches = currentHash === evidence.file_hash;
+    if (!fileHashMatches) {
+      await setVerificationStatus(evidence.id, "Tampered");
+      await recordIntegrityTransition({
+        firId: evidence.fir_id, evidenceId: evidence.id, eventType: "EVIDENCE_TAMPERED", source: "Integrity verifier",
+        summary: `Evidence file hash does not match: ${evidence.file_name}`,
+        metadata: { fileName: evidence.file_name, originalHash: evidence.file_hash, currentHash, fileHashMatches, previousStatus: evidence.verification_status, nextStatus: "Tampered", verificationMethod: "Manual", checkedAt },
+      });
+      return response.json({ verification: { ...base, currentHash, fileHashMatches, verified: false, status: "Tampered" } });
+    }
+
+    if (evidence.verification_status === "Missing") await recordIntegrityTransition({
+      firId: evidence.fir_id, evidenceId: evidence.id, eventType: "EVIDENCE_RECOVERED", source: "Integrity verifier",
+      summary: `Previously missing evidence is available again: ${evidence.file_name}`,
+      metadata: { fileName: evidence.file_name, previousStatus: "Missing", verificationMethod: "Manual", checkedAt },
+    });
+
+    let blockchainRecord: Awaited<ReturnType<typeof verifyEvidenceOnBlockchain>>;
+    try {
+      blockchainRecord = await verifyEvidenceOnBlockchain(evidence.file_hash);
+    } catch (error) {
+      const failureReason = error instanceof Error ? error.message : "Blockchain verification could not be completed.";
+      await recordVerificationFailure({ firId: evidence.fir_id, evidenceId: evidence.id, fileName: evidence.file_name, source: "Blockchain", category: "rpc-unavailable", checkedAt, failureReason, originalHash: evidence.file_hash, currentHash });
+      return response.json({ verification: { ...base, currentHash, fileHashMatches, verified: false, status: "Verification Error", verificationError: failureReason } });
+    }
+
+    const blockchainFirMatches = blockchainRecord.exists && blockchainRecord.firNumber === fir.fir_number;
+    const blockchain = { exists: blockchainRecord.exists, firNumber: blockchainRecord.firNumber, firNumberMatches: blockchainFirMatches, timestamp: blockchainRecord.timestamp, uploadedBy: blockchainRecord.uploadedBy, transactionHash: evidence.blockchain_tx_hash };
+    if (!blockchainRecord.exists || !blockchainFirMatches) {
+      await recordVerificationFailure({ firId: evidence.fir_id, evidenceId: evidence.id, fileName: evidence.file_name, source: "Blockchain", category: blockchainRecord.exists ? "fir-mismatch" : "record-absent", checkedAt, failureReason: "Blockchain record is missing or does not match this FIR.", originalHash: evidence.file_hash, currentHash });
+      return response.json({ verification: { ...base, currentHash, fileHashMatches, blockchain, verified: false, status: "Verification Error", verificationError: "Blockchain record is missing or does not match this FIR." } });
+    }
+
+    await setVerificationStatus(evidence.id, "Verified");
+    await recordIntegrityTransition({
+      firId: evidence.fir_id, evidenceId: evidence.id, eventType: "EVIDENCE_VERIFIED", source: "Integrity verifier",
+      summary: `Evidence integrity verified: ${evidence.file_name}`,
+      metadata: { fileName: evidence.file_name, originalHash: evidence.file_hash, currentHash, fileHashMatches, blockchainExists: true, blockchainFirMatches: true, previousStatus: evidence.verification_status, nextStatus: "Verified", verificationMethod: "Manual", checkedAt },
+    });
+    return response.json({ verification: { ...base, currentHash, fileHashMatches, blockchain, verified: true, status: "Verified" } });
+  } catch (error) {
+    console.error("Evidence verification failed:", error);
+    return response.status(500).json({ error: error instanceof Error ? error.message : "Unable to verify evidence." });
   }
-);
+});
 
 
 /*
@@ -632,6 +602,8 @@ router.post(
           .select(`
             id,
             fir_id,
+            file_name,
+            storage_path,
             file_hash,
             blockchain_tx_hash,
             verification_status
@@ -662,6 +634,34 @@ router.post(
         });
       }
 
+      // A retry may anchor the immutable original hash, but it must never
+      // certify a missing or modified Storage object as currently verified.
+      const { data: storedFile, error: storedFileError } = await supabase.storage
+        .from("evidence")
+        .download(evidence.storage_path);
+      if (storedFileError || !storedFile) {
+        if (storedFileError && isConfirmedMissingStorageObject(storedFileError)) {
+          await setVerificationStatus(evidence.id, "Missing");
+          await recordIntegrityTransition({
+            firId: evidence.fir_id, evidenceId: evidence.id, eventType: "EVIDENCE_MISSING", source: "Integrity verifier",
+            summary: `Evidence file unavailable during blockchain registration retry: ${evidence.file_name}`,
+            metadata: { fileName: evidence.file_name, storagePath: evidence.storage_path, originalHash: evidence.file_hash, previousStatus: evidence.verification_status, nextStatus: "Missing", verificationMethod: "Manual registration retry" },
+          });
+          return response.status(409).json({ error: "Evidence file is missing from Supabase Storage; blockchain registration was not retried.", verificationStatus: "Missing" });
+        }
+        throw new Error(`Evidence file could not be checked before blockchain registration: ${storedFileError?.message ?? "Storage returned no file data."}`);
+      }
+      const storedHash = createHash("sha256").update(Buffer.from(await storedFile.arrayBuffer())).digest("hex");
+      if (storedHash !== evidence.file_hash) {
+        await setVerificationStatus(evidence.id, "Tampered");
+        await recordIntegrityTransition({
+          firId: evidence.fir_id, evidenceId: evidence.id, eventType: "EVIDENCE_TAMPERED", source: "Integrity verifier",
+          summary: `Evidence file hash does not match during blockchain registration retry: ${evidence.file_name}`,
+          metadata: { fileName: evidence.file_name, originalHash: evidence.file_hash, currentHash: storedHash, previousStatus: evidence.verification_status, nextStatus: "Tampered", verificationMethod: "Manual registration retry" },
+        });
+        return response.status(409).json({ error: "Evidence file has changed; blockchain registration was not retried.", verificationStatus: "Tampered" });
+      }
+
       // -----------------------------------------------------
       // 3. Check whether the hash already exists
       //    on the blockchain.
@@ -677,6 +677,10 @@ router.post(
       // -----------------------------------------------------
 
       if (existing.exists) {
+
+        if (existing.firNumber !== fir.fir_number) {
+          return response.status(409).json({ error: "The existing blockchain record is associated with a different FIR; evidence was not marked Verified." });
+        }
 
         /*
          * We know the evidence is anchored on-chain.
@@ -721,6 +725,16 @@ router.post(
             }`
           );
         }
+
+        if (evidence.verification_status !== "Verified" || !evidence.blockchain_tx_hash) await recordCustodyEvent({
+          firId: evidence.fir_id,
+          evidenceId: evidence.id,
+          eventType: "BLOCKCHAIN_REGISTERED",
+          source: "Blockchain",
+          actorLabel: "Sepolia",
+          summary: "Existing blockchain evidence record confirmed",
+          metadata: { fileHash: evidence.file_hash, transactionHash: updatedEvidence.blockchain_tx_hash },
+        });
 
         return response.json({
           message:
@@ -800,6 +814,16 @@ router.post(
           }`
         );
       }
+
+      await recordCustodyEvent({
+        firId: evidence.fir_id,
+        evidenceId: evidence.id,
+        eventType: "BLOCKCHAIN_REGISTERED",
+        source: "Blockchain",
+        actorLabel: "Sepolia",
+        summary: "Evidence anchored on blockchain after retry",
+        metadata: { fileHash: evidence.file_hash, transactionHash: blockchainResult.transactionHash, blockNumber: blockchainResult.blockNumber },
+      });
 
       // -----------------------------------------------------
       // 7. Return result

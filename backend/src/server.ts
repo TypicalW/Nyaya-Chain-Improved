@@ -7,6 +7,7 @@ import nodemailer from "nodemailer"
 import { Resend } from "resend"
 import { z } from "zod"
 import evidenceRouter from "./evidence.js"
+import custodyRouter, { recordCustodyEvent } from "./custody.js"
 
 const env = z.object({
   PORT: z.coerce.number().default(4000),
@@ -389,6 +390,21 @@ app.post(
         )
       }
 
+      await recordCustodyEvent({
+        firId: fir.id,
+        eventType: "FIR_REGISTERED",
+        summary: "FIR registered",
+        metadata: { firNumber: fir.fir_number },
+      })
+
+      await recordCustodyEvent({
+        firId: fir.id,
+        eventType: aiAvailable ? "AI_ANALYSIS_COMPLETED" : "AI_ANALYSIS_FALLBACK",
+        source: "Legal analysis service",
+        summary: aiAvailable ? "Legal information analysis completed" : "AI analysis unavailable; safe fallback guidance recorded",
+        metadata: { aiAvailable },
+      })
+
       // -----------------------------------------------------
       // Send registration email
       // -----------------------------------------------------
@@ -416,12 +432,27 @@ app.post(
             fir.id
           )
 
+        await recordCustodyEvent({
+          firId: fir.id,
+          eventType: "REGISTRATION_EMAIL_SENT",
+          source: "Email service",
+          summary: "Registration confirmation email sent",
+          metadata: { recipient: input.complainantEmail },
+        })
+
       } catch (mailError) {
 
         console.error(
           "Registration email failed:",
           mailError
         )
+
+        await recordCustodyEvent({
+          firId: fir.id,
+          eventType: "REGISTRATION_EMAIL_FAILED",
+          source: "Email service",
+          summary: "Registration confirmation email could not be sent",
+        })
       }
 
       // -----------------------------------------------------
@@ -499,15 +530,31 @@ app.get(
       )
       .limit(limit)
 
-    if (error) {
+    // if (error) {
 
-      return response
-        .status(500)
-        .json({
-          error:
-            "Unable to load FIR registrations.",
-        })
-    }
+    //   return response
+    //     .status(500)
+    //     .json({
+    //       error:
+    //         "Unable to load FIR registrations.",
+    //     })
+    // }
+
+if (error) {
+  console.error("SUPABASE FIR FETCH ERROR:", error);
+
+  return response
+    .status(500)
+    .json({
+      error: "Unable to load FIR registrations.",
+      details: error.message,
+      code: error.code,
+      hint: error.hint,
+    });
+}
+
+
+
 
     response.json({
       firs: data.map(
@@ -767,6 +814,16 @@ app.patch(
           request.body
         )
 
+      const { data: existingFir, error: existingFirError } = await supabase
+        .from("firs")
+        .select("status")
+        .eq("id", id)
+        .single()
+
+      if (existingFirError || !existingFir) {
+        return response.status(404).json({ error: "FIR not found or its status could not be updated." })
+      }
+
       const {
         data: fir,
         error,
@@ -802,6 +859,15 @@ app.patch(
             error:
               "FIR not found or its status could not be updated.",
           })
+      }
+
+      if (existingFir.status !== fir.status) {
+        await recordCustodyEvent({
+          firId: fir.id,
+          eventType: "CASE_STATUS_CHANGED",
+          summary: `Case status changed from ${existingFir.status} to ${fir.status}`,
+          metadata: { previousStatus: existingFir.status, nextStatus: fir.status },
+        })
       }
 
       response.json({
@@ -860,6 +926,11 @@ app.patch(
 app.use(
   "/api/evidence",
   evidenceRouter
+)
+
+app.use(
+  "/api/custody",
+  custodyRouter
 )
 
 

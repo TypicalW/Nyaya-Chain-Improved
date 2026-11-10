@@ -11,7 +11,7 @@ const features = [
     icon: Brain,
     title: "AI-Assisted FIR Analysis",
     description:
-      "When a report is filed, Gemini reviews the narrative and suggests relevant BNS sections, with legacy IPC references where useful. It's informational only -- every suggestion is flagged for review by a qualified legal professional.",
+      "When a report is filed, the legal analysis service reviews the narrative and suggests relevant BNS sections, with legacy IPC references where useful. It's informational only -- every suggestion is flagged for review by a qualified legal professional.",
   },
   {
     icon: Hash,
